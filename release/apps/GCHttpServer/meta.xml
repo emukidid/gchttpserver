@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>GCHttpServer</name>
+  <coder>emu_kidid</coder>
+  <version>0.1</version>
+  <release_date>20260109</release_date>
+  <short_description>GC Http Server (for Wii)</short_description> 
+  <long_description>
+    A basic HTTP server for the Wii
+    Features:
+    - /storage pages to serve content from your Wii
+    - /status page
+    - / mapped to /www on your storage
+    - Concurrent access
+	- Large file streaming
+</long_description> 
+<ahb_access />
+</app>

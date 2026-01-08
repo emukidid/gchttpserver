@@ -1,11 +1,11 @@
 ## GC HTTP Server
 
-A small HTTP Server for the GameCube, smashed together using [picohttpparser](https://github.com/h2o/picohttpparser) and the network example from [libogc2](https://github.com/extremscorner/libogc2)
+A small HTTP Server for the GameCube/Wii, smashed together using [picohttpparser](https://github.com/h2o/picohttpparser) and the network example from [libogc2](https://github.com/extremscorner/libogc2)
 
 There are probably bugs, please contribute :)
 
 ### Building
-Follow the Installation Instructions from [libogc2](https://github.com/extremscorner/libogc2) and once done, type 'make' in the root of this codebase.
+Follow the Installation Instructions from [libogc2](https://github.com/extremscorner/libogc2) and once done, type 'make' and 'make -f Makefile.wii' in the root of this codebase.
 
 ### Features
 * /storage serves contents of first available storage
