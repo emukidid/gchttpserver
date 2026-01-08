@@ -1,0 +1,37 @@
+name: Build
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitppc:latest
+
+    steps:
+    - name: Install packages
+      run: |
+        sudo dkp-pacman-key --recv-keys C8A2759C315CFBC3429CC2E422B803BA8AA3D7CE --keyserver keyserver.ubuntu.com
+        sudo dkp-pacman-key --lsign-key C8A2759C315CFBC3429CC2E422B803BA8AA3D7CE
+        sudo sed -i '/^\[dkp-libs\]$/,$d' /opt/devkitpro/pacman/etc/pacman.conf
+        sudo echo -e '[extremscorner-devkitpro]\nServer = https://packages.extremscorner.org/devkitpro/linux/$arch' >> /opt/devkitpro/pacman/etc/pacman.conf
+        sudo dkp-pacman -Sy
+        sudo dkp-pacman -S --noconfirm --ask 4 gamecube-tools-git libogc2 libogc2-libdvm
+
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Build artifacts
+      run: make
+      
+    - name: Build artifacts (Wii)
+      run: make -f Makefile.wii
+
+    - name: Copy DOL files
+      run: cp ./gchttpserver.dol ./release/gchttpserver.dol && cp ./gchttpserver-wii.dol ./release/apps/GCHttpServer/boot.dol
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@main
+      with:
+        name: gchttpserver
+        path: ./release/

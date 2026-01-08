@@ -1,6 +1,6 @@
 // server.c
 //
-// Minimal GameCube HTTP file server using libogc2 + LWP + a single-file HTTP parser.
+// Minimal GameCube/Wii HTTP file server using libogc2 + LWP + a single-file HTTP parser.
 // - Uses picohttpparser.h (MIT) for HTTP parsing (https://github.com/h2o/picohttpparser).
 // - Serves files from the /www directory to the web root.
 // - LRU cache with fixed total size from a malloc'ed arena.
@@ -19,6 +19,12 @@
 #include <dirent.h>
 #include <ogc/timesupp.h>
 #include "picohttpparser.h"
+
+#ifdef HW_RVL
+#define PLATFORM "Wii"
+#else
+#define PLATFORM "GameCube"
+#endif
 
 // Config
 #define SERVER_PORT       8080
@@ -632,13 +638,14 @@ static void send_status_page(int sock)
 
     int n = snprintf(page, sizeof(page),
         "<html><body>"
-        "<h1>GameCube HTTP Server Status</h1>"
+        "<h1>%s HTTP Server Status</h1>"
         "<p><b>Uptime:</b> %u seconds</p>"
         "<p><b>Active threads:</b> %d / %d</p>"
         "<p><b>Cache usage:</b> %.1f KB / %.1f KB</p>"
         "<p><b>Cached entries:</b> %d</p>"
         "<p><b>Total data served:</b> %s</p>"
         "<h2>Thread Slots</h2><ul>",
+		PLATFORM,
         uptime_sec,
         active_threads, MAX_THREADS,
         used_kb, total_kb,
@@ -870,7 +877,7 @@ static int find_free_thread_slot(void)
     return -1;
 }
 
-void start_gc_http_server(void)
+void *gc_http_server(void *arg)
 {
 	server_start_ticks = gettime();
 	LWP_MutexInit(&fs_mutex, 0);
@@ -879,10 +886,10 @@ void start_gc_http_server(void)
     cache_init(CACHE_SIZE_BYTES);
 
     printf("[HTTP] Creating socket...\n");
-    int sock = net_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int sock = net_socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (sock < 0) {
         printf("[HTTP] ERROR: net_socket failed\n");
-        return;
+        return NULL;
     }
 
     printf("[HTTP] Binding to port %d...\n", SERVER_PORT);
@@ -896,14 +903,14 @@ void start_gc_http_server(void)
     if (net_bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         printf("[HTTP] ERROR: net_bind failed\n");
         net_close(sock);
-        return;
+        return NULL;
     }
     printf("[HTTP] Bind OK\n");
 
 	if (net_listen(sock, 4) < 0) {
         printf("[HTTP] ERROR: net_listen failed\n");
         net_close(sock);
-        return;
+        return NULL;
     }
     printf("[HTTP] Listening on port %d\n", SERVER_PORT);
 
@@ -948,4 +955,5 @@ void start_gc_http_server(void)
 	    LWP_DetachThread(g_threads[slot]);
 
     }
+	return NULL;
 }

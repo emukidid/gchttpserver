@@ -8,6 +8,9 @@
 #include <debug.h>
 #include <errno.h>
 #include <fat.h>
+#ifdef HW_RVL
+#include <wiiuse/wpad.h>
+#endif
 
 static void *xfb = NULL;
 static GXRModeObj *rmode = NULL;
@@ -15,8 +18,9 @@ static GXRModeObj *rmode = NULL;
 void *initialise();
 void *httpd (void *arg);
 
-static	lwp_t httd_handle = (lwp_t)NULL;
+static	lwp_t httpd_handle = LWP_THREAD_NULL;
 
+extern void *gc_http_server(void *arg);
 //---------------------------------------------------------------------------------
 int main(int argc, char **argv) {
 //---------------------------------------------------------------------------------
@@ -27,8 +31,11 @@ int main(int argc, char **argv) {
 	char netmask[16] = {0};
 	
 	xfb = initialise();
-
-	printf ("\nGC HTTP Server\n");
+#ifdef HW_RVL
+	printf ("\nWii HTTP Server by emu_kidid\n");
+#else
+	printf ("\nGC HTTP Server by emu_kidid\n");
+#endif
 	printf("Configuring network ...\n");
 
 	// Configure the network interface
@@ -36,12 +43,12 @@ int main(int argc, char **argv) {
 	if (ret>=0) {
 		printf ("network configured, ip: %s, gw: %s, mask %s\n", localip, gateway, netmask);
 
-		LWP_CreateThread(	&httd_handle,	/* thread handle */ 
-							httpd,			/* code */ 
+		LWP_CreateThread(	&httpd_handle,	/* thread handle */ 
+							gc_http_server, /* code */ 
 							localip,		/* arg pointer for thread */
 							NULL,			/* stack base */ 
-							64*1024,		/* stack size */
-							50				/* thread priority */ );
+							128*1024,		/* stack size */
+							LWP_PRIO_NORMAL	/* thread priority */ );
 	} else {
 		printf ("network configuration failed!\n");
 	}
@@ -49,6 +56,14 @@ int main(int argc, char **argv) {
 	while(1) {
 
 		VIDEO_WaitVSync();
+#ifdef HW_RVL
+		WPAD_ScanPads();
+		int wPadButtonsDown = WPAD_ButtonsDown(0);
+
+		if (wPadButtonsDown & WPAD_BUTTON_HOME) {
+			exit(0);
+		}
+#endif
 		PAD_ScanPads();
 
 		int buttonsDown = PAD_ButtonsDown(0);
@@ -61,17 +76,6 @@ int main(int argc, char **argv) {
 	return 0;
 }
 
-extern void start_gc_http_server(void);
-//---------------------------------------------------------------------------------
-void *httpd (void *arg) {
-//---------------------------------------------------------------------------------
-
-	while(1) {
-		start_gc_http_server();
-	}
-	return NULL;
-}
-
 //---------------------------------------------------------------------------------
 void *initialise() {
 //---------------------------------------------------------------------------------
@@ -80,6 +84,9 @@ void *initialise() {
 
 	VIDEO_Init();
 	PAD_Init();
+#ifdef HW_RVL
+	WPAD_Init();
+#endif
 	
 	rmode = VIDEO_GetPreferredMode(NULL);
 	framebuffer = SYS_AllocateFramebuffer(rmode);
