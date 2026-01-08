@@ -1,9 +1,11 @@
-// gc_webserver.c
+// server.c
 //
 // Minimal GameCube HTTP file server using libogc2 + LWP + a single-file HTTP parser.
-// - Uses picohttpparser.h (MIT) for HTTP parsing (paste header into this file).
-// - Serves files from a directory.
+// - Uses picohttpparser.h (MIT) for HTTP parsing (https://github.com/h2o/picohttpparser).
+// - Serves files from the /www directory to the web root.
 // - LRU cache with fixed total size from a malloc'ed arena.
+// - Large file streaming support
+// - /status and /storage generated pages
 // - Simple per-connection thread model via LWP.
 
 #include <gccore.h>
@@ -942,7 +944,7 @@ void start_gc_http_server(void)
                          ctx,
                          NULL,
                          0x20000,
-                         50);
+                         LWP_PRIO_NORMAL);
 	    LWP_DetachThread(g_threads[slot]);
 
     }

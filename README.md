@@ -15,3 +15,8 @@ Follow the Installation Instructions from [libogc2](https://github.com/extremsco
 * Attempts to cache frequently accessed files (up to 1MB worth)
 * Streams larger files (> 512KB) directly from storage
 * Works with the BBA or any other supported network adapter from libogc2
+
+### Usage
+* Boot the .dol, your IP will be displayed on the screen
+* Navigate to http://<ip>:8080/status
+* If you would like files served, have some storage available and go /storage or / (if you have a /www dir on the storage).
