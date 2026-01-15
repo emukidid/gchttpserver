@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <ogc/timesupp.h>
 #include "picohttpparser.h"
 
@@ -50,6 +51,7 @@ static mutex_t fs_mutex;
 static u64 server_start_ticks = 0;
 static mutex_t stats_mutex;
 static u64 g_total_bytes_served = 0;
+static u64 g_total_bytes_recv = 0;
 
 #define PAGE_SIZE 100   // entries per page
 
@@ -82,6 +84,11 @@ typedef struct cache_s {
 } cache_t;
 
 static cache_t g_cache;
+
+void handle_upload(int sock,
+                          const char *req_buf, int req_len, int header_bytes,
+                          struct phr_header *headers, size_t num_headers,
+                          const char *query);
 
 // Initialize cache with a single malloc'ed arena
 static void cache_init(size_t size_bytes)
@@ -527,6 +534,29 @@ static void send_directory_listing(int sock,
         n += snprintf(pagebuf + n, sizeof(pagebuf) - n,
             "<a href=\"%s?page=%d\">Next</a>", clean_url, page+1);
     }
+	
+	n += snprintf(pagebuf + n, sizeof(pagebuf) - n,
+		"<h3>Upload file (to this folder)</h3>"
+		"<form id=\"upload_form\" action=\"/upload?path=%s&overwrite=0\" "
+		"method=\"POST\" enctype=\"multipart/form-data\" "
+		"onsubmit=\"document.getElementById('upload_status').innerText='Uploading... (writing asynchronously to storage)';\">"
+		"<input type=\"file\" name=\"file\" required>"
+		"<input type=\"hidden\" id=\"ow_hidden\" name=\"overwrite\" value=\"0\">"
+		"<label>"
+			"<input type=\"checkbox\" id=\"ow_box\" "
+			"onclick=\""
+				"var v=this.checked?1:0;"
+				"document.getElementById('ow_hidden').value=v;"
+				"document.getElementById('upload_form').action="
+					"'/upload?path=%s&overwrite=' + v;"
+			"\"> "
+			"Overwrite if file exists"
+		"</label>"
+		"<input type=\"submit\" value=\"Upload\">"
+		"</form>"
+		"<div id=\"upload_status\"></div>",
+		clean_url, clean_url
+	);
 
     snprintf(pagebuf + n, sizeof(pagebuf) - n, "</p></body></html>");
 
@@ -610,12 +640,15 @@ static void send_status_page(int sock)
 {
     char page[8192];
     char data_served_str[64];
+	char data_recv_str[64];
 
 	LWP_MutexLock(stats_mutex);
 	u64 served = g_total_bytes_served;
+	u64 recv = g_total_bytes_recv;
 	LWP_MutexUnlock(stats_mutex);
 
 	format_bytes(served, data_served_str, sizeof(data_served_str));
+	format_bytes(recv, data_recv_str, sizeof(data_recv_str));
 
 
     int used_entries = 0;
@@ -644,13 +677,15 @@ static void send_status_page(int sock)
         "<p><b>Cache usage:</b> %.1f KB / %.1f KB</p>"
         "<p><b>Cached entries:</b> %d</p>"
         "<p><b>Total data served:</b> %s</p>"
+		"<p><b>Total data received:</b> %s</p>"
         "<h2>Thread Slots</h2><ul>",
 		PLATFORM,
         uptime_sec,
         active_threads, MAX_THREADS,
         used_kb, total_kb,
         used_entries,
-        data_served_str
+        data_served_str,
+		data_recv_str
     );
 
     for (int i = 0; i < MAX_THREADS; i++) {
@@ -675,174 +710,282 @@ static void send_status_page(int sock)
     send_response(sock, 200, "OK", "text/html", page, strlen(page));
 }
 
+// ----------------------------- Upload helpers ---------------------------
+
+static const char *find_header(struct phr_header *headers, size_t num_headers, const char *name)
+{
+    for (size_t i = 0; i < num_headers; i++) {
+        if (headers[i].name_len == strlen(name) &&
+            strncasecmp(headers[i].name, name, headers[i].name_len) == 0) {
+            return headers[i].value;
+        }
+    }
+    return NULL;
+}
+
+static int get_content_length(struct phr_header *headers, size_t num_headers)
+{
+    const char *cl = find_header(headers, num_headers, "Content-Length");
+    if (!cl) return -1;
+    return atoi(cl);
+}
+
+static int extract_boundary(const char *ct, char *out, size_t out_size)
+{
+    if (!ct) return -1;
+
+    const char *b = strstr(ct, "boundary=");
+    if (!b) return -1;
+
+    b += 9; // skip "boundary="
+
+    // Skip leading spaces
+    while (*b == ' ' || *b == '\t') b++;
+
+    // Optional quotes
+    int quoted = 0;
+    if (*b == '"') {
+        quoted = 1;
+        b++;
+    }
+
+    size_t i = 0;
+    while (*b && i + 1 < out_size) {
+        if (quoted) {
+            if (*b == '"') break;
+        } else {
+            if (*b == ';' || *b == ' ' || *b == '\t' || *b == '\r' || *b == '\n')
+                break;
+        }
+        out[i++] = *b++;
+    }
+    out[i] = '\0';
+
+    return (i > 0) ? (int)i : -1;
+}
+
+static void parse_upload_path_param(const char *query, char *out, size_t out_size)
+{
+    out[0] = '\0';
+    if (!query) return;
+
+    const char *p = strstr(query, "path=");
+    if (!p) return;
+    p += 5;
+
+    char buf[512];
+    size_t i = 0;
+    while (*p && *p != '&' && i + 1 < sizeof(buf)) {
+        buf[i++] = *p++;
+    }
+    buf[i] = '\0';
+
+    url_decode(buf);
+    snprintf(out, out_size, "%s", buf);
+}
+
+static int query_has_overwrite(const char *query)
+{
+    if (!query) return 0;
+    const char *p = strstr(query, "overwrite=");
+    if (!p) return 0;
+    p += 10;
+    return (*p == '1');
+}
+
+int net_recv_with_stats(int sock, void *buf, int len, int flags)
+{
+    int r = net_recv(sock, buf, len, flags);
+
+    if (r > 0) {
+        LWP_MutexLock(stats_mutex);
+        g_total_bytes_recv += r;
+        LWP_MutexUnlock(stats_mutex);
+    }
+
+    return r;
+}
+
 // Handle a single HTTP request from a connected socket
 static void handle_http_request(int sock, const char *doc_root)
 {
-	printf("[HTTP] Receiving request...\n");
+    printf("[HTTP] Receiving request...\n");
     char buf[MAX_REQUEST_SIZE];
-    int r = net_recv(sock, buf, sizeof(buf), 0);
+    int r = net_recv_with_stats(sock, buf, sizeof(buf), 0);
     if (r <= 0) return;
 
     const char *method;
-	size_t method_len;
+    size_t method_len;
 
-	const char *path;
-	size_t path_len;
+    const char *path;
+    size_t path_len;
 
-	int minor_version;
+    int minor_version;
 
-	struct phr_header headers[16];
-	size_t num_headers = sizeof(headers) / sizeof(headers[0]);
+    struct phr_header headers[16];
+    size_t num_headers = sizeof(headers) / sizeof(headers[0]);
 
-	int pret = phr_parse_request(
-		buf, r,
-		&method, &method_len,
-		&path, &path_len,
-		&minor_version,
-		headers, &num_headers,
-		0
-	);
-	if (pret <= 0) {
+    int pret = phr_parse_request(
+        buf, r,
+        &method, &method_len,
+        &path, &path_len,
+        &minor_version,
+        headers, &num_headers,
+        0
+    );
+    if (pret <= 0) {
         printf("[HTTP] ERROR: Bad request (pret=%d)\n", pret);
         const char *msg = "Bad Request";
-        send_response(sock, 400, "Bad Request",
-                      "text/plain", msg, strlen(msg));
+        send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
         return;
     }
 
-    // we only support GET
-    if (strncmp(method, "GET", 3) != 0) {
-        const char *msg = "Method Not Allowed";
-        send_response(sock, 405, "Method Not Allowed",
-                      "text/plain", msg, strlen(msg));
-        return;
-    }
+    printf("[HTTP] Method: %.*s\n", (int)method_len, method);
+    printf("[HTTP] Raw path: %.*s\n", (int)path_len, path);
 
     char req_path[MAX_PATH_LEN];
     if ((size_t)(path - buf) + 1 >= sizeof(req_path)) {
         const char *msg = "Request-URI Too Long";
-        send_response(sock, 414, "URI Too Long",
-                      "text/plain", msg, strlen(msg));
+        send_response(sock, 414, "URI Too Long", "text/plain", msg, strlen(msg));
         return;
     }
-	printf("[HTTP] Method: %.*s\n", (int)method_len, method);
-    printf("[HTTP] Raw path: %.*s\n", (int)path_len, path);
 
-    // Copy only the actual URL path (no headers)
-	snprintf(req_path, sizeof(req_path), "%.*s", (int)path_len, path);
+    snprintf(req_path, sizeof(req_path), "%.*s", (int)path_len, path);
 
-	char *path_only;
-	char *query;
-	split_path_query(req_path, &path_only, &query);
+    char *path_only;
+    char *query;
+    split_path_query(req_path, &path_only, &query);
     // Remove any trailing spaces
-	char *space = strchr(req_path, ' ');
-	if (space) *space = '\0';
+    char *space = strchr(req_path, ' ');
+    if (space) *space = '\0';
 
 
     char rel_path[MAX_PATH_LEN];
     normalize_path(path_only, rel_path, sizeof(rel_path));
     printf("[HTTP] Normalized path: [%s]\n", rel_path);
 
-	if (strncmp(rel_path, "storage", 7) == 0) {
+    // POST HANDLING (upload)
+    if (strncmp(method, "POST", 4) == 0) {
 
-		// Strip "storage" prefix
-		const char *sub = rel_path + 7;
-		if (*sub == '/') sub++;
+        if (strcmp(rel_path, "upload") == 0) {
+            printf("[HTTP] Handling upload\n");
+            int header_len = pret;
+			handle_upload(sock, buf, r, header_len, headers, num_headers, query);
+            return;
+        }
 
-		// Build real filesystem path
-		char fs_path[512];
-		snprintf(fs_path, sizeof(fs_path), "/%s", sub);
+        const char *msg = "Method Not Allowed";
+        send_response(sock, 405, "Method Not Allowed", "text/plain", msg, strlen(msg));
+        return;
+    }
 
-		// If ends with / or is empty → directory listing
-		if (sub[0] == '\0' || rel_path[strlen(rel_path)-1] == '/') {
-			// Clean path prefix (NO query)
-			char clean_url[512];
-			snprintf(clean_url, sizeof(clean_url), "/storage/%s", sub);
+    // GET HANDLING
+    if (strncmp(method, "GET", 3) != 0) {
+        const char *msg = "Method Not Allowed";
+        send_response(sock, 405, "Method Not Allowed", "text/plain", msg, strlen(msg));
+        return;
+    }
 
-			// Full URL (WITH query) for display only
-			char display_url[768];
-			if (query)
-				snprintf(display_url, sizeof(display_url), "%s?%s", clean_url, query);
-			else
-				snprintf(display_url, sizeof(display_url), "%s", clean_url);
+    // /storage/... handling
+    if (strncmp(rel_path, "storage", 7) == 0) {
 
-			send_directory_listing(sock, fs_path, clean_url, display_url);
-			return;
-		}
+        const char *sub = rel_path + 7;
+        if (*sub == '/') sub++;
 
-		// Otherwise treat as file download
-		const char *data = NULL;
-		size_t size = 0;
+        char fs_path[512];
+        snprintf(fs_path, sizeof(fs_path), "/%s", sub);
 
-		int cache_state = cache_get_file("/", fs_path + 1, &data, &size);
+        // Directory listing
+        if (sub[0] == '\0' || rel_path[strlen(rel_path)-1] == '/') {
 
-		if (cache_state == 0) {
-			printf("[HTTP] 404 Not Found: %s\n", fs_path);
-			const char *msg = "Not Found";
-			send_response(sock, 404, "Not Found", "text/plain", msg, strlen(msg));
-			return;
-		}
+            char clean_url[512];
+            snprintf(clean_url, sizeof(clean_url), "/storage/%s", sub);
 
-		const char *ct = guess_content_type(fs_path);
+            char display_url[768];
+            if (query)
+                snprintf(display_url, sizeof(display_url), "%s?%s", clean_url, query);
+            else
+                snprintf(display_url, sizeof(display_url), "%s", clean_url);
 
-		if (cache_state == 3) {
-			printf("[HTTP] Streaming large file: %s (%u bytes)\n", fs_path, (unsigned)size);
-			stream_file(sock, fs_path, size, ct);
-			return;
-		}
+            send_directory_listing(sock, fs_path, clean_url, display_url);
+            return;
+        }
 
-		printf("[HTTP] Sending file %s (%u bytes)\n", fs_path, (unsigned)size);
-		send_response(sock, 200, "OK", ct, data, size);
+        // File download
+        const char *data = NULL;
+        size_t size = 0;
 
-		if (cache_state == 2)
-			free((void*)data);
+        int cache_state = cache_get_file("/", fs_path + 1, &data, &size);
 
-		return;
-	}
-	
-	// Status
-	if (strcmp(rel_path, "status") == 0 ||
-		strcmp(rel_path, "status.html") == 0)
-	{
-		printf("[HTTP] Serving status page\n");
-		send_status_page(sock);
-		return;
-	}
+        if (cache_state == CACHE_ERROR) {
+            printf("[HTTP] 404 Not Found: %s\n", fs_path);
+            const char *msg = "Not Found";
+            send_response(sock, 404, "Not Found", "text/plain", msg, strlen(msg));
+            return;
+        }
+
+        const char *ct = guess_content_type(fs_path);
+
+        if (cache_state == CACHE_STREAM) {
+            printf("[HTTP] Streaming large file: %s (%u bytes)\n", fs_path, (unsigned)size);
+            stream_file(sock, fs_path, size, ct);
+            return;
+        }
+
+        printf("[HTTP] Sending file %s (%u bytes)\n", fs_path, (unsigned)size);
+        send_response(sock, 200, "OK", ct, data, size);
+
+        if (cache_state == CACHE_LOADED)
+            free((void*)data);
+
+        return;
+    }
+
+    // /status
+    if (strcmp(rel_path, "status") == 0 ||
+        strcmp(rel_path, "status.html") == 0)
+    {
+        printf("[HTTP] Serving status page\n");
+        send_status_page(sock);
+        return;
+    }
+
+    // Static file mapping handling from /www
     const char *data = NULL;
     size_t size = 0;
     int cache_state = cache_get_file(doc_root, rel_path, &data, &size);
 
-	if (cache_state == 0) {
-		printf("[HTTP] 404 Not Found: %s\n", rel_path);
-		const char *msg = "Not Found";
-		send_response(sock, 404, "Not Found", "text/plain", msg, strlen(msg));
-		return;
-	}
+    if (cache_state == CACHE_ERROR) {
+        printf("[HTTP] 404 Not Found: %s\n", rel_path);
+        const char *msg = "Not Found";
+        send_response(sock, 404, "Not Found", "text/plain", msg, strlen(msg));
+        return;
+    }
 
-	const char *ct = guess_content_type(rel_path);
+    const char *ct = guess_content_type(rel_path);
 
 	// STREAMING MODE
-	if (cache_state == 3) {
-		printf("[HTTP] Streaming large file: %s (%u bytes)\n", rel_path, (unsigned)size);
+    if (cache_state == CACHE_STREAM) {
+        printf("[HTTP] Streaming large file: %s (%u bytes)\n", rel_path, (unsigned)size);
 
-		char full_path[512];
-		snprintf(full_path, sizeof(full_path), "%s/%s", doc_root, rel_path);
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/%s", doc_root, rel_path);
 
-		stream_file(sock, full_path, size, ct);
-		return;
-	}
+        stream_file(sock, full_path, size, ct);
+        return;
+    }
 
 	// NORMAL MODE (cached or small uncached)
-	if (cache_state == 1)
-		printf("[HTTP] Cache HIT: %s (%u bytes)\n", rel_path, (unsigned)size);
-	else if (cache_state == 2)
-		printf("[HTTP] Cache MISS (loaded uncached): %s (%u bytes)\n", rel_path, (unsigned)size);
+    if (cache_state == CACHE_HIT)
+        printf("[HTTP] Cache HIT: %s (%u bytes)\n", rel_path, (unsigned)size);
+    else if (cache_state == CACHE_LOADED)
+        printf("[HTTP] Cache MISS (loaded uncached): %s (%u bytes)\n", rel_path, (unsigned)size);
 
-	printf("[HTTP] Sending 200 OK (%u bytes)\n", (unsigned)size);
-	send_response(sock, 200, "OK", ct, data, size);
+    printf("[HTTP] Sending 200 OK (%u bytes)\n", (unsigned)size);
+    send_response(sock, 200, "OK", ct, data, size);
 
-	if (cache_state == 2)
-		free((void*)data);
+    if (cache_state == CACHE_LOADED)
+        free((void*)data);
 }
 
 // ----------------------------- Thread entry ---------------------------
@@ -956,4 +1099,381 @@ void *gc_http_server(void *arg)
 
     }
 	return NULL;
+}
+#define UPLOAD_BUF_SIZE 131072
+
+static const char *memmem_safe(const char *haystack, size_t haystack_len,
+                               const char *needle, size_t needle_len)
+{
+    if (!haystack || !needle || needle_len == 0 || haystack_len < needle_len)
+        return NULL;
+    for (size_t i = 0; i + needle_len <= haystack_len; i++) {
+        if (memcmp(haystack + i, needle, needle_len) == 0)
+            return haystack + i;
+    }
+    return NULL;
+}
+
+static int read_more_into_buf(
+    int sock,
+    char *buf, int *buf_len,
+    const char **body_ptr, int *body_already,
+    int *remaining
+) {
+    if (*remaining <= 0)
+        return 0;
+
+    int space = UPLOAD_BUF_SIZE - *buf_len;
+    if (space <= 0)
+        return 0;
+
+    int to_copy = 0;
+
+    if (*body_already > 0) {
+        to_copy = (*body_already < space) ? *body_already : space;
+        memcpy(buf + *buf_len, *body_ptr, to_copy);
+        *body_ptr += to_copy;
+        *body_already -= to_copy;
+    } else {
+        int r = net_recv_with_stats(sock, buf + *buf_len, space, 0);
+        if (r <= 0)
+            return r;
+        to_copy = r;
+    }
+
+    *buf_len += to_copy;
+    *remaining -= to_copy;
+    return to_copy;
+}
+
+void drain_post_body(int sock, int remaining) {
+	// Drain remaining POST body so browser doesn't hang
+	char drain_buf[4096];
+	while (remaining > 0) {
+		int to_read = (remaining > sizeof(drain_buf)) ? sizeof(drain_buf) : remaining;
+		int r = net_recv_with_stats(sock, drain_buf, to_read, 0);
+		if (r <= 0)
+			break;
+		remaining -= r;
+	}
+}
+
+void handle_upload(int sock,
+                   const char *req_buf, int req_len, int header_bytes,
+                   struct phr_header *headers, size_t num_headers,
+                   const char *query)
+{
+    if (header_bytes > req_len)
+        header_bytes = req_len;
+
+    const char *ct = find_header(headers, num_headers, "Content-Type");
+    char boundary[128];
+    if (extract_boundary(ct, boundary, sizeof(boundary)) <= 0) {
+        const char *msg = "Unsupported Content-Type";
+		printf("[UPLOAD] Sending Unsupported Content-Type\n");
+        send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+        return;
+    }
+
+    int content_length = get_content_length(headers, num_headers);
+    int body_already = (req_len > header_bytes) ? (req_len - header_bytes) : 0;
+    int remaining = content_length - body_already;
+	printf("[UPLOAD] Content-Length: %d\n", content_length);
+    if (content_length <= 0 || content_length > (0x7FFFFFFF)) {
+		drain_post_body(sock, remaining);
+        const char *msg = "Invalid or too large upload";
+		printf("[UPLOAD] Sending Invalid or too large upload\n");
+        send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+        return;
+    }
+
+    char b_start[160];
+    char b_end[160];
+    snprintf(b_start, sizeof(b_start), "--%s", boundary);
+    snprintf(b_end, sizeof(b_end), "--%s--", boundary);
+    size_t b_start_len = strlen(b_start);
+    size_t b_end_len   = strlen(b_end);
+
+    const char *body_ptr = req_buf + header_bytes;
+    char buf[UPLOAD_BUF_SIZE];
+    int buf_len = 0;
+
+    // Seed buffer with any already-received body bytes
+    if (body_already > 0) {
+        int to_copy = (body_already < UPLOAD_BUF_SIZE) ? body_already : UPLOAD_BUF_SIZE;
+        memcpy(buf, body_ptr, to_copy);
+        buf_len = to_copy;
+        body_ptr += to_copy;
+        body_already -= to_copy;
+        remaining = content_length - body_already - buf_len;
+    }
+
+    // Skip initial boundary line: "--boundary\r\n"
+    while (1) {
+        const char *p = memmem_safe(buf, buf_len, b_start, b_start_len);
+        if (p) {
+            int off = (int)(p - buf);
+            int need = off + (int)b_start_len + 2; // + "\r\n"
+            while (buf_len < need && remaining > 0) {
+                if (read_more_into_buf(sock, buf, &buf_len, &body_ptr, &body_already, &remaining) <= 0)
+                    break;
+            }
+            if (buf_len < need) {
+				drain_post_body(sock, remaining);
+                const char *msg = "Malformed multipart data";
+                send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+                return;
+            }
+            int consume = need;
+            memmove(buf, buf + consume, buf_len - consume);
+            buf_len -= consume;
+            break;
+        }
+        if (buf_len >= (int)(b_start_len + 4)) {
+			drain_post_body(sock, remaining);
+            const char *msg = "Malformed multipart data";
+            send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+            return;
+        }
+        if (read_more_into_buf(sock, buf, &buf_len, &body_ptr, &body_already, &remaining) <= 0) {
+			drain_post_body(sock, remaining);
+            const char *msg = "Malformed multipart data";
+            send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+            return;
+        }
+    }
+	printf("[UPLOAD] Skipped boundary\n");
+
+    // Read part headers (Content-Disposition, etc.) until blank line
+    char header_block[1024];
+    int header_len = 0;
+    while (1) {
+        const char *sep = memmem_safe(buf, buf_len, "\r\n\r\n", 4);
+        if (sep) {
+            int hdr_bytes = (int)(sep - buf) + 4;
+            int copy = (hdr_bytes < (int)sizeof(header_block)) ? hdr_bytes : (int)sizeof(header_block) - 1;
+            memcpy(header_block, buf, copy);
+            header_block[copy] = '\0';
+            int consume = hdr_bytes;
+            memmove(buf, buf + consume, buf_len - consume);
+            buf_len -= consume;
+            header_len = copy;
+            break;
+        }
+        if (buf_len >= (int)sizeof(header_block) - 1) {
+			drain_post_body(sock, remaining);
+            const char *msg = "Multipart headers too large";
+            send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+            return;
+        }
+        if (read_more_into_buf(sock, buf, &buf_len, &body_ptr, &body_already, &remaining) <= 0) {
+			drain_post_body(sock, remaining);
+            const char *msg = "Malformed multipart headers";
+            send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+            return;
+        }
+    }
+	printf("[UPLOAD] Read part headers\n");
+
+    // Extract filename from header_block
+    const char *file_part = strstr(header_block, "Content-Disposition:");
+    if (!file_part) {
+		drain_post_body(sock, remaining);
+        const char *msg = "No file part";
+        send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+        return;
+    }
+    const char *fn = strstr(file_part, "filename=\"");
+    if (!fn) {
+		drain_post_body(sock, remaining);
+        const char *msg = "Missing filename";
+        send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+        return;
+    }
+    fn += 10;
+    char filename[256];
+    size_t fi = 0;
+    while (*fn && *fn != '"' && fi + 1 < sizeof(filename)) {
+        filename[fi++] = *fn++;
+    }
+    filename[fi] = '\0';
+
+    // Build path on SD (etc) from query
+    char logical_path[512];
+    parse_upload_path_param(query, logical_path, sizeof(logical_path));
+    if (logical_path[0] == '\0') {
+		drain_post_body(sock, remaining);
+        const char *msg = "Missing path parameter";
+        send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+        return;
+    }
+
+    char fs_dir[512];
+    if (strncmp(logical_path, "/storage", 8) == 0) {
+        const char *sub = logical_path + 8;
+        if (*sub == '/') sub++;
+        snprintf(fs_dir, sizeof(fs_dir), "/%s", sub);
+    } else {
+        snprintf(fs_dir, sizeof(fs_dir), "%s", logical_path);
+    }
+
+    size_t dl = strlen(fs_dir);
+    if (dl == 0 || fs_dir[dl - 1] != '/') {
+        fs_dir[dl] = '/';
+        fs_dir[dl + 1] = '\0';
+    }
+
+    char fs_path[768];
+    snprintf(fs_path, sizeof(fs_path), "%s%s", fs_dir, filename);
+	printf("[UPLOAD] Destination %s\n", fs_path);
+   
+	int overwrite = query_has_overwrite(query);
+
+    struct stat st;
+    int exists = (stat(fs_path, &st) == 0);
+    if (exists && !overwrite) {
+		drain_post_body(sock, remaining);
+		char page[1024];
+		char existing_size[64];
+		format_bytes((u64)st.st_size, existing_size, sizeof(existing_size));
+		int n = snprintf(page, sizeof(page),
+			"<html><body>"
+			"<h1>Upload error</h1>"
+			"<p>File <code>%s</code> already exists.</p>"
+			"<p><b>Existing size:</b> %s</p>"
+			"<p><a href=\"javascript:history.back()\">Go back</a></p>"
+			"</body></html>",
+			filename, existing_size
+		);
+
+		send_response(sock, 409, "Conflict", "text/html", page, (size_t)n);
+		return;
+	}
+
+    LWP_MutexLock(fs_mutex);
+    FILE *f = fopen(fs_path, "wb");
+    if (!f) {
+        LWP_MutexUnlock(fs_mutex);
+		drain_post_body(sock, remaining);
+        const char *msg = "Failed to open file for writing";
+        send_response(sock, 500, "Internal Server Error", "text/plain", msg, strlen(msg));
+        return;
+    }
+
+    // Stream file data until next boundary
+    size_t total_written = 0;
+    while (1) {
+		//printf("[STREAM] remaining=%d buf_len=%d\n", remaining, buf_len);
+        // Ensure we have enough data to check for boundary
+        if (buf_len < (int)(b_start_len + 4) && remaining > 0) {
+            if (read_more_into_buf(sock, buf, &buf_len, &body_ptr, &body_already, &remaining) <= 0 && remaining > 0) {
+                fclose(f);
+                LWP_MutexUnlock(fs_mutex);
+				drain_post_body(sock, remaining);
+                const char *msg = "Upload aborted";
+                send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+                return;
+            }
+        }
+
+        const char *nb = memmem_safe(buf, buf_len, b_start, b_start_len);
+        const char *ne = memmem_safe(buf, buf_len, b_end, b_end_len);
+        const char *next_boundary = NULL;
+        int is_final = 0;
+
+        if (nb && ne)
+            next_boundary = (nb < ne) ? nb : ne;
+        else if (nb)
+            next_boundary = nb;
+        else if (ne)
+            next_boundary = ne;
+
+        if (next_boundary == ne)
+            is_final = 1;
+
+        if (next_boundary) {
+            int off = (int)(next_boundary - buf);
+            int write_len = off;
+            if (write_len >= 2 &&
+                buf[write_len - 2] == '\r' &&
+                buf[write_len - 1] == '\n')
+            {
+                write_len -= 2;
+            }
+            if (write_len > 0) {
+                size_t w = fwrite(buf, 1, (size_t)write_len, f);
+                total_written += w;
+                if (w != (size_t)write_len) {
+                    fclose(f);
+                    LWP_MutexUnlock(fs_mutex);
+					drain_post_body(sock, remaining);
+                    const char *msg = "Failed to write complete file";
+                    send_response(sock, 500, "Internal Server Error", "text/plain", msg, strlen(msg));
+                    return;
+                }
+            }
+            // Consume up to boundary (including preceding CRLF)
+            int consume = off;
+            memmove(buf, buf + consume, buf_len - consume);
+            buf_len -= consume;
+            break;
+        }
+
+        // No boundary yet: write all but a tail that might contain partial boundary
+        int safe = buf_len - (int)(b_start_len + 4);
+        if (safe > 0) {
+            size_t w = fwrite(buf, 1, (size_t)safe, f);
+            total_written += w;
+            if (w != (size_t)safe) {
+                fclose(f);
+                LWP_MutexUnlock(fs_mutex);
+				drain_post_body(sock, remaining);
+                const char *msg = "Failed to write complete file";
+                send_response(sock, 500, "Internal Server Error", "text/plain", msg, strlen(msg));
+                return;
+            }
+            memmove(buf, buf + safe, buf_len - safe);
+            buf_len -= safe;
+        }
+
+        if (remaining <= 0 && buf_len <= (int)(b_start_len + 4)) {
+            fclose(f);
+            LWP_MutexUnlock(fs_mutex);
+			drain_post_body(sock, remaining);
+            const char *msg = "Malformed multipart body";
+            send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+            return;
+        }
+
+        if (read_more_into_buf(sock, buf, &buf_len, &body_ptr, &body_already, &remaining) <= 0 && remaining > 0) {
+            fclose(f);
+            LWP_MutexUnlock(fs_mutex);
+			drain_post_body(sock, remaining);
+            const char *msg = "Upload aborted";
+            send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+            return;
+        }
+    }
+
+    fclose(f);
+    LWP_MutexUnlock(fs_mutex);
+
+    if (strncmp(fs_path, "/www/", 5) == 0) {
+        // TODO: evict cache entry for this file if present
+    }
+
+    char page[1024];
+    int n = snprintf(page, sizeof(page),
+        "<html><body>"
+        "<h1>Upload complete</h1>"
+        "<p>Uploaded <code>%s</code> (%u bytes).</p>"
+        "<p>Redirecting back to <code>%s</code> in 2 seconds...</p>"
+        "<script>"
+        "setTimeout(function(){ window.location='%s'; }, 2000);"
+        "</script>"
+        "</body></html>",
+        filename, (unsigned)total_written, logical_path, logical_path
+    );
+
+    send_response(sock, 200, "OK", "text/html", page, (size_t)n);
 }
