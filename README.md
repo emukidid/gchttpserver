@@ -11,6 +11,7 @@ Follow the Installation Instructions from [libogc2](https://github.com/extremsco
 * /storage serves contents of first available storage
 * /status page shows stats
 * / mounts to /www dir on first available storage
+* File uploads (use at your own risk)
 * Concurrent access support (8 threads)
 * Attempts to cache frequently accessed files (up to 1MB worth)
 * Streams larger files (> 512KB) directly from storage

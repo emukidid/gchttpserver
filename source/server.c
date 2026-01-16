@@ -52,6 +52,8 @@ static u64 server_start_ticks = 0;
 static mutex_t stats_mutex;
 static u64 g_total_bytes_served = 0;
 static u64 g_total_bytes_recv = 0;
+static mutex_t cache_mutex;
+static mutex_t thread_mutex;
 
 #define PAGE_SIZE 100   // entries per page
 
@@ -143,13 +145,19 @@ static void cache_evict_one(void)
 // Find existing cache entry by path
 static cache_entry_t *cache_find(const char *path)
 {
+    cache_entry_t *result = NULL;
+
+    LWP_MutexLock(cache_mutex);
     for (int i = 0; i < MAX_CACHE_ENTRIES; ++i) {
         if (g_cache.entries[i].size == 0) continue;
         if (strcmp(g_cache.entries[i].path, path) == 0) {
-            return &g_cache.entries[i];
+            result = &g_cache.entries[i];
+            break;
         }
     }
-    return NULL;
+    LWP_MutexUnlock(cache_mutex);
+
+    return result;
 }
 
 // Create a new entry for path with given size, returns pointer to writable buffer
@@ -218,7 +226,7 @@ static int cache_get_file(const char *doc_root, const char *rel_path,
 	fseek(f, 0, SEEK_END);
 	long sz = ftell(f);
 	fseek(f, 0, SEEK_SET);
-	printf("Got size [%ld]\n" ,sz);
+	//printf("Got size [%ld]\n" ,sz);
 
 	if (sz < 0) {
 		fclose(f);
@@ -237,7 +245,9 @@ static int cache_get_file(const char *doc_root, const char *rel_path,
 	// Check cache for small files
 	cache_entry_t *e = cache_find(full_path);
 	if (e) {
+		LWP_MutexLock(cache_mutex);
 		cache_lru_move_to_front(e);
+		LWP_MutexUnlock(cache_mutex);
 		*out_data = e->data;
 		*out_size = e->size;
 		fclose(f);
@@ -264,7 +274,7 @@ static int cache_get_file(const char *doc_root, const char *rel_path,
 	}
 
 	// Read into cache arena
-	printf("fread size %ld to %08X\n", sz, (u32)new_e->data);
+	//printf("fread size %ld to %08X\n", sz, (u32)new_e->data);
 	if (fread(new_e->data, 1, sz, f) != (size_t)sz) {
 		fclose(f);
 		new_e->size = 0;
@@ -658,10 +668,13 @@ static void send_status_page(int sock)
     }
 
     int active_threads = 0;
-    for (int i = 0; i < MAX_THREADS; i++) {
-        if (g_thread_used[i])
-            active_threads++;
-    }
+    LWP_MutexLock(thread_mutex);
+	for (int i = 0; i < MAX_THREADS; i++) {
+		if (g_thread_used[i])
+			active_threads++;
+	}
+	LWP_MutexUnlock(thread_mutex);
+
 
     float used_kb = (float)g_cache.used / 1024.0f;
     float total_kb = (float)g_cache.arena_size / 1024.0f;
@@ -1002,29 +1015,43 @@ static void *client_thread_func(void *arg)
     free(ctx);
 
     // Mark this LWP slot as free
+	LWP_MutexLock(thread_mutex);
     for (int i = 0; i < MAX_THREADS; ++i) {
-        if (g_threads[i] == LWP_GetSelf()) {
-            g_thread_used[i] = 0;
-            break;
-        }
-    }
+		if (g_threads[i] == LWP_GetSelf()) {
+			g_thread_used[i] = 0;
+			g_threads[i] = 0;
+			break;
+		}
+	}
+	LWP_MutexUnlock(thread_mutex);
 	printf("[HTTP] Thread %u finished\n", (unsigned)LWP_GetSelf());
     return NULL;
 }
 
 static int find_free_thread_slot(void)
 {
+    int idx = -1;
+    LWP_MutexLock(thread_mutex);
     for (int i = 0; i < MAX_THREADS; ++i) {
-        if (!g_thread_used[i]) return i;
+        if (!g_thread_used[i]) {
+            g_thread_used[i] = 1; // reserve immediately
+            idx = i;
+            break;
+        }
     }
-    return -1;
+    LWP_MutexUnlock(thread_mutex);
+    return idx;
 }
+
 
 void *gc_http_server(void *arg)
 {
 	server_start_ticks = gettime();
 	LWP_MutexInit(&fs_mutex, 0);
 	LWP_MutexInit(&stats_mutex, 0);
+	LWP_MutexInit(&cache_mutex, 0);
+	LWP_MutexInit(&thread_mutex, 0);
+
     printf("[HTTP] Initializing cache (%u bytes)\n", CACHE_SIZE_BYTES);
     cache_init(CACHE_SIZE_BYTES);
 
@@ -1080,27 +1107,26 @@ void *gc_http_server(void *arg)
             printf("[HTTP] WARNING: No free thread slots, dropping connection\n");
             net_close(csock);
             continue;
-        }
+        } else {
+			LWP_MutexLock(thread_mutex);
+			printf("[HTTP] Assigned thread slot %d\n", slot);
 
-        printf("[HTTP] Assigned thread slot %d\n", slot);
-
-        client_ctx_t *ctx = (client_ctx_t *)malloc(sizeof(client_ctx_t));
-        ctx->sock = csock;
-        ctx->addr = client_addr;
-
-        g_thread_used[slot] = 1;
-        LWP_CreateThread(&g_threads[slot],
-                         client_thread_func,
-                         ctx,
-                         NULL,
-                         0x20000,
-                         LWP_PRIO_NORMAL);
-	    LWP_DetachThread(g_threads[slot]);
-
+			client_ctx_t *ctx = (client_ctx_t *)malloc(sizeof(client_ctx_t));
+			ctx->sock = csock;
+			ctx->addr = client_addr;
+			LWP_MutexUnlock(thread_mutex);
+			LWP_CreateThread(&g_threads[slot],
+							 client_thread_func,
+							 ctx,
+							 NULL,
+							 0x20000,
+							 LWP_PRIO_NORMAL);
+			LWP_DetachThread(g_threads[slot]);
+		}
     }
 	return NULL;
 }
-#define UPLOAD_BUF_SIZE 131072
+#define UPLOAD_BUF_SIZE 40960
 
 static const char *memmem_safe(const char *haystack, size_t haystack_len,
                                const char *needle, size_t needle_len)
@@ -1120,12 +1146,21 @@ static int read_more_into_buf(
     const char **body_ptr, int *body_already,
     int *remaining
 ) {
+	
+	//printf("[RECV] read_more_into_buf: buf_len=%u remaining=%u\n",
+	//		   (unsigned)*buf_len, (unsigned)*remaining);
+
     if (*remaining <= 0)
         return 0;
 
-    int space = UPLOAD_BUF_SIZE - *buf_len;
-    if (space <= 0)
-        return 0;
+    if (*buf_len < 0) *buf_len = 0;
+	if (*buf_len > UPLOAD_BUF_SIZE) *buf_len = UPLOAD_BUF_SIZE;
+
+	int space = UPLOAD_BUF_SIZE - *buf_len;
+	if (space <= 0) {
+		// buffer full — caller must consume before reading more
+		return 0;
+	}
 
     int to_copy = 0;
 
@@ -1134,8 +1169,12 @@ static int read_more_into_buf(
         memcpy(buf + *buf_len, *body_ptr, to_copy);
         *body_ptr += to_copy;
         *body_already -= to_copy;
-    } else {
+    } else {	
+		//printf("[RECV] about to net_recv: space=%d buf_len=%u remaining=%u\n",
+		//	   space, (unsigned)*buf_len, (unsigned)*remaining);
+		
         int r = net_recv_with_stats(sock, buf + *buf_len, space, 0);
+		//printf("[RECV] net_recv returned %d (len=%d)\n", r, space);
         if (r <= 0)
             return r;
         to_copy = r;
@@ -1207,6 +1246,19 @@ void handle_upload(int sock,
         body_already -= to_copy;
         remaining = content_length - body_already - buf_len;
     }
+	
+	// Wii FIX: ensure we have at least some body data before boundary search
+	if (buf_len == 0 && remaining > 0) {
+		int r = read_more_into_buf(sock, buf, &buf_len, &body_ptr, &body_already, &remaining);
+		if (r <= 0) {
+			const char *msg = "Malformed multipart data (no initial body)";
+			send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
+			return;
+		}
+	}
+	
+	//printf("[UPLOAD] After initial seed: body_already=%d buf_len=%d remaining=%d\n",
+    //   body_already, buf_len, remaining);
 
     // Skip initial boundary line: "--boundary\r\n"
     while (1) {
@@ -1220,29 +1272,33 @@ void handle_upload(int sock,
             }
             if (buf_len < need) {
 				drain_post_body(sock, remaining);
-                const char *msg = "Malformed multipart data";
+                const char *msg = "Malformed multipart data (1)";
                 send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
                 return;
             }
             int consume = need;
-            memmove(buf, buf + consume, buf_len - consume);
-            buf_len -= consume;
+			int new_len = buf_len - consume;
+			if (new_len < 0) new_len = 0;
+			if (new_len > UPLOAD_BUF_SIZE) new_len = UPLOAD_BUF_SIZE;
+
+			memmove(buf, buf + consume, new_len);
+			buf_len = new_len;
             break;
         }
         if (buf_len >= (int)(b_start_len + 4)) {
 			drain_post_body(sock, remaining);
-            const char *msg = "Malformed multipart data";
+            const char *msg = "Malformed multipart data (2)";
             send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
             return;
         }
         if (read_more_into_buf(sock, buf, &buf_len, &body_ptr, &body_already, &remaining) <= 0) {
 			drain_post_body(sock, remaining);
-            const char *msg = "Malformed multipart data";
+            const char *msg = "Malformed multipart data (3)";
             send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
             return;
         }
     }
-	printf("[UPLOAD] Skipped boundary\n");
+	//printf("[UPLOAD] Skipped boundary\n");
 
     // Read part headers (Content-Disposition, etc.) until blank line
     char header_block[1024];
@@ -1255,8 +1311,12 @@ void handle_upload(int sock,
             memcpy(header_block, buf, copy);
             header_block[copy] = '\0';
             int consume = hdr_bytes;
-            memmove(buf, buf + consume, buf_len - consume);
-            buf_len -= consume;
+            int new_len = buf_len - consume;
+			if (new_len < 0) new_len = 0;
+			if (new_len > UPLOAD_BUF_SIZE) new_len = UPLOAD_BUF_SIZE;
+
+			memmove(buf, buf + consume, new_len);
+			buf_len = new_len;
             header_len = copy;
             break;
         }
@@ -1273,7 +1333,7 @@ void handle_upload(int sock,
             return;
         }
     }
-	printf("[UPLOAD] Read part headers\n");
+	//printf("[UPLOAD] Read part headers\n");
 
     // Extract filename from header_block
     const char *file_part = strstr(header_block, "Content-Disposition:");
@@ -1360,17 +1420,18 @@ void handle_upload(int sock,
         return;
     }
 
+	printf("[STREAM-START] buf_len=%d remaining=%d\n", buf_len, remaining);
     // Stream file data until next boundary
     size_t total_written = 0;
     while (1) {
 		//printf("[STREAM] remaining=%d buf_len=%d\n", remaining, buf_len);
         // Ensure we have enough data to check for boundary
         if (buf_len < (int)(b_start_len + 4) && remaining > 0) {
-            if (read_more_into_buf(sock, buf, &buf_len, &body_ptr, &body_already, &remaining) <= 0 && remaining > 0) {
+			if (read_more_into_buf(sock, buf, &buf_len, &body_ptr, &body_already, &remaining) <= 0 && remaining > 0) {
                 fclose(f);
                 LWP_MutexUnlock(fs_mutex);
 				drain_post_body(sock, remaining);
-                const char *msg = "Upload aborted";
+                const char *msg = "Upload aborted (1)";
                 send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
                 return;
             }
@@ -1414,15 +1475,24 @@ void handle_upload(int sock,
             }
             // Consume up to boundary (including preceding CRLF)
             int consume = off;
-            memmove(buf, buf + consume, buf_len - consume);
-            buf_len -= consume;
-            break;
+            int new_len = buf_len - consume;
+			if (new_len < 0) new_len = 0;
+			if (new_len > UPLOAD_BUF_SIZE) new_len = UPLOAD_BUF_SIZE;
+
+			memmove(buf, buf + consume, new_len);
+			buf_len = new_len;
+			break;
         }
 
         // No boundary yet: write all but a tail that might contain partial boundary
         int safe = buf_len - (int)(b_start_len + 4);
-        if (safe > 0) {
-            size_t w = fwrite(buf, 1, (size_t)safe, f);
+        if (safe >= 32768 || remaining == 0) {
+			u64 t0 = gettime();
+			size_t w = fwrite(buf, 1, safe, f);
+			u64 t1 = gettime();
+			//printf("[WRITE] wrote %u bytes in %u ms\n",
+			//	   (unsigned)w, (unsigned)diff_msec(t0, t1));
+
             total_written += w;
             if (w != (size_t)safe) {
                 fclose(f);
@@ -1432,8 +1502,12 @@ void handle_upload(int sock,
                 send_response(sock, 500, "Internal Server Error", "text/plain", msg, strlen(msg));
                 return;
             }
-            memmove(buf, buf + safe, buf_len - safe);
-            buf_len -= safe;
+            int new_len = buf_len - safe;
+			if (new_len < 0) new_len = 0;
+			if (new_len > UPLOAD_BUF_SIZE) new_len = UPLOAD_BUF_SIZE;
+
+			memmove(buf, buf + safe, new_len);
+			buf_len = new_len;
         }
 
         if (remaining <= 0 && buf_len <= (int)(b_start_len + 4)) {
@@ -1444,12 +1518,14 @@ void handle_upload(int sock,
             send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
             return;
         }
-
         if (read_more_into_buf(sock, buf, &buf_len, &body_ptr, &body_already, &remaining) <= 0 && remaining > 0) {
+				printf("[ABORT2] read_more returned <=0, remaining=%d buf_len=%d\n",
+		   remaining, buf_len);
             fclose(f);
             LWP_MutexUnlock(fs_mutex);
 			drain_post_body(sock, remaining);
-            const char *msg = "Upload aborted";
+
+            const char *msg = "Upload aborted (2)";
             send_response(sock, 400, "Bad Request", "text/plain", msg, strlen(msg));
             return;
         }

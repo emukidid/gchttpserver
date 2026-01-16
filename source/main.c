@@ -32,9 +32,9 @@ int main(int argc, char **argv) {
 	
 	xfb = initialise();
 #ifdef HW_RVL
-	printf ("\nWii HTTP Server by emu_kidid\n");
+	printf ("\nWii HTTP Server 0.2 by emu_kidid\n");
 #else
-	printf ("\nGC HTTP Server by emu_kidid\n");
+	printf ("\nGC HTTP Server 0.2 by emu_kidid\n");
 #endif
 	printf("Configuring network ...\n");
 
